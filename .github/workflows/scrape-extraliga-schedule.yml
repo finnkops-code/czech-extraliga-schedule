@@ -1,0 +1,37 @@
+name: Czech Extraliga Schedule Scraper
+
+on:
+  schedule:
+    - cron: '0 * * * *'     # elk uur
+    - cron: '30 11 * * 5'   # vrijdag 13:30 NL (voor weekendwedstrijden)
+    - cron: '30 11 * * 6'   # zaterdag 13:30 NL
+    - cron: '30 17 * * 6'   # zaterdag 19:30 NL (avondwedstrijden)
+    - cron: '30 11 * * 0'   # zondag 13:30 NL
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Python instellen
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Schedule scrapen
+        run: python scraper_schedule.py
+
+      - name: JSON committen
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add schedule_extraliga.json
+          git diff --staged --quiet || git commit -m "Extraliga schedule bijgewerkt: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
