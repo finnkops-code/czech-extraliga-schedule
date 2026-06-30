@@ -2,9 +2,12 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+import datetime as dt
+from datetime import timezone, timedelta
+from playwright.sync_api import sync_playwright
 
 SCHEDULE_URL = "https://stats.baseball.cz/en/events/extraliga-2026/schedule-and-results"
+JSON_FILE    = "schedule_extraliga.json"
 
 TEAM_CODES = {
     "HRO": "Hroši",
@@ -17,143 +20,191 @@ TEAM_CODES = {
     "SAB": "SaBaT",
 }
 
+# JavaScript dat direct in de browser-DOM de wedstrijddata uitpikt
+EXTRACT_JS = """
+() => {
+    const results = [];
 
-def install_playwright():
-    subprocess.run([sys.executable, "-m", "pip", "install", "playwright", "-q"], check=True)
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"], check=True)
+    // Debug: log alle tekst op de pagina die op scores lijkt
+    console.log('DOM ready, zoeken naar wedstrijden...');
 
+    // Probeer verschillende selectors die WBSC-platforms gebruiken
+    const selectors = [
+        '.game-card', '.game', '.match', '.fixture',
+        '[class*="game"]', '[class*="match"]', '[class*="fixture"]',
+        'tr', 'li'
+    ];
 
-def fetch_html_playwright(url):
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        try:
-            page.wait_for_selector("text=Visitor", timeout=10000)
-        except Exception:
-            print("  ⚠️  'Visitor' selector timeout")
-        html = page.content()
-        browser.close()
-    return html
+    // Zoek score-patronen: "X : Y" of "X - Y" met teamcodes
+    // WBSC-structuur: Visitor / teamcode / score / Home / teamcode / datum
+    const allText = document.body.innerText;
+    console.log('Eerste 2000 chars:', allText.substring(0, 2000));
 
+    // Zoek alle elementen met 3-letter teamcodes
+    const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_TEXT,
+        null
+    );
 
-def html_to_lines(html):
-    html = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', html, flags=re.DOTALL)
-    html = re.sub(r'<br\s*/?>', '\n', html)
-    html = re.sub(r'</(?:div|p|li|tr|td|th|h[1-6]|section|article)>', '\n', html)
-    html = re.sub(r'<[^>]+>', ' ', html)
-    html = html.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&nbsp;', ' ')
-    lines = []
-    for line in html.splitlines():
-        line = re.sub(r'[ \t]+', ' ', line).strip()
-        if line:
-            lines.append(line)
-    return lines
+    const textNodes = [];
+    let node;
+    while (node = walker.nextNode()) {
+        const t = node.textContent.trim();
+        if (t.length > 0) textNodes.push(t);
+    }
 
+    console.log('Totaal tekstknopen:', textNodes.length);
 
-def parse_datetime(raw):
-    """'20/06/2026 13:00 (UTC +2) - Final' → datum, tijdstip, is_final"""
-    m = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})', raw)
-    if not m:
-        return None, None, False
-    dt = datetime.strptime(m.group(1) + ' ' + m.group(2), "%d/%m/%Y %H:%M")
-    is_final = bool(re.search(r'\bfinal\b', raw, re.IGNORECASE))
-    return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M"), is_final
+    // Zoek score-patronen
+    for (let i = 0; i < textNodes.length; i++) {
+        const t = textNodes[i];
+        if (/^\\d+\\s*:\\s*\\d+$/.test(t)) {
+            const context = textNodes.slice(Math.max(0, i-5), i+6);
+            console.log('SCORE gevonden:', JSON.stringify(context));
+        }
+    }
+
+    return {
+        url: window.location.href,
+        title: document.title,
+        textSample: allText.substring(0, 3000),
+        textNodeCount: textNodes.length,
+        scoreNodes: textNodes.filter(t => /^\\d+\\s*:\\s*\\d+$/.test(t)).length,
+    };
+}
+"""
+
+# Tweede JS: als we weten hoe de DOM eruit ziet, extraheer de wedstrijden
+EXTRACT_GAMES_JS = """
+() => {
+    const games = [];
+    const TEAM_CODES = {
+        "HRO": "Hroši", "KOT": "Kotlářka", "DRA": "Draci", "HLU": "Hluboká",
+        "NUC": "Nuclears", "EAG": "Eagles", "ARR": "Arrows", "SAB": "SaBaT",
+    };
+
+    // Haal alle tekstnodes op als platte array
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+    const texts = [];
+    let node;
+    while (node = walker.nextNode()) {
+        const t = node.textContent.trim();
+        if (t) texts.push(t);
+    }
+
+    // Loop door tekstnodes, zoek score-patronen
+    for (let i = 0; i < texts.length; i++) {
+        const scoreMatch = texts[i].match(/^(\\d+)\\s*:\\s*(\\d+)$/);
+        if (!scoreMatch) continue;
+
+        const scoreUit   = parseInt(scoreMatch[1]);
+        const scoreThuis = parseInt(scoreMatch[2]);
+
+        // Zoek uit_code achteruit
+        let uitCode = null;
+        for (let j = i - 1; j >= Math.max(0, i - 6); j--) {
+            if (/^[A-Z]{3}$/.test(texts[j])) { uitCode = texts[j]; break; }
+        }
+
+        // Zoek thuis_code en datum vooruit
+        let thuisCode = null, datumRaw = null;
+        for (let j = i + 1; j < Math.min(texts.length, i + 10); j++) {
+            if (/^[A-Z]{3}$/.test(texts[j]) && !thuisCode) thuisCode = texts[j];
+            if (/\\d{2}\\/\\d{2}\\/\\d{4}/.test(texts[j])) { datumRaw = texts[j]; break; }
+        }
+
+        if (!uitCode || !thuisCode || !datumRaw) continue;
+
+        // Parse datum: "20/06/2026 13:00 (UTC +2) - Final"
+        const dmatch = datumRaw.match(/(\\d{2})\\/(\\d{2})\\/(\\d{4})\\s+(\\d{2}:\\d{2})/);
+        if (!dmatch) continue;
+        const datum    = `${dmatch[3]}-${dmatch[2]}-${dmatch[1]}`;
+        const tijdstip = dmatch[4];
+        const isFinal  = /final/i.test(datumRaw);
+
+        games.push({
+            datum,
+            tijdstip,
+            thuis:       TEAM_CODES[thuisCode] || thuisCode,
+            thuis_code:  thuisCode,
+            uit:         TEAM_CODES[uitCode]   || uitCode,
+            uit_code:    uitCode,
+            score_thuis: isFinal ? scoreThuis : null,
+            score_uit:   isFinal ? scoreUit   : null,
+            gamestatus:  isFinal ? "F" : "",
+            gespeeld:    isFinal,
+        });
+    }
+
+    return games;
+}
+"""
 
 
 def format_dag(datum_str):
-    """'2026-06-20' → 'zaterdag 20 juni'"""
-    dagen = ["maandag","dinsdag","woensdag","donderdag","vrijdag","zaterdag","zondag"]
+    dagen   = ["maandag","dinsdag","woensdag","donderdag","vrijdag","zaterdag","zondag"]
     maanden = ["","januari","februari","maart","april","mei","juni",
                "juli","augustus","september","oktober","november","december"]
-    dt = datetime.strptime(datum_str, "%Y-%m-%d")
-    return f"{dagen[dt.weekday()]} {dt.day} {maanden[dt.month]}"
-
-
-def parse_games(html):
-    lines = html_to_lines(html)
-    print(f"Totaal regels na stripping: {len(lines)}")
-
-    # Debug: toon alle score-regels met context
-    print("\nScore-regels gevonden:")
-    for i, l in enumerate(lines):
-        if re.match(r'^\d+\s*:\s*\d+$', l):
-            context = lines[max(0, i-4):i+5]
-            print(f"  r{i}: {[repr(x) for x in context]}")
-
-    uitslagen, programma = [], []
-    game_id = 1
-    i = 0
-
-    while i < len(lines):
-        score_m = re.match(r'^(\d+)\s*:\s*(\d+)$', lines[i])
-        if score_m:
-            score_uit   = int(score_m.group(1))
-            score_thuis = int(score_m.group(2))
-
-            # Zoek uit_code achteruit (3-letter hoofdletter code)
-            uit_code = None
-            for j in range(i - 1, max(i - 6, -1), -1):
-                if re.match(r'^[A-Z]{3}$', lines[j]):
-                    uit_code = lines[j]
-                    break
-
-            # Zoek thuis_code en datum vooruit
-            thuis_code = datum_str = tijdstip_str = None
-            is_final = False
-            for j in range(i + 1, min(i + 10, len(lines))):
-                if re.match(r'^[A-Z]{3}$', lines[j]) and thuis_code is None:
-                    thuis_code = lines[j]
-                if re.search(r'\d{2}/\d{2}/\d{4}', lines[j]):
-                    datum_str, tijdstip_str, is_final = parse_datetime(lines[j])
-                    break
-
-            if uit_code and thuis_code and datum_str:
-                w = {
-                    "id":           game_id,
-                    "datum":        datum_str,
-                    "tijdstip":     tijdstip_str,
-                    "dag":          format_dag(datum_str),
-                    "thuis":        TEAM_CODES.get(thuis_code, thuis_code),
-                    "thuis_code":   thuis_code,
-                    "uit":          TEAM_CODES.get(uit_code, uit_code),
-                    "uit_code":     uit_code,
-                    "score_thuis":  score_thuis if is_final else None,
-                    "score_uit":    score_uit   if is_final else None,
-                    "thuis_innings": [],
-                    "uit_innings":   [],
-                    "innings":      None,
-                    "gamestatus":   "F" if is_final else "",
-                    "locatie":      None,
-                    "stadion":      None,
-                    "gespeeld":     is_final,
-                }
-                game_id += 1
-                (uitslagen if is_final else programma).append(w)
-            else:
-                print(f"  ⚠️  Score op r{i} niet volledig: uit={uit_code} thuis={thuis_code} datum={datum_str}")
-        i += 1
-
-    return uitslagen, programma
+    d = dt.datetime.strptime(datum_str, "%Y-%m-%d")
+    return f"{dagen[d.weekday()]} {d.day} {maanden[d.month]}"
 
 
 def main():
-    print("Playwright installeren...")
-    install_playwright()
+    print(f"Ophalen van {SCHEDULE_URL} via Playwright...")
 
-    print(f"\nOphalen van {SCHEDULE_URL} via Playwright...")
-    html = fetch_html_playwright(SCHEDULE_URL)
-    print(f"Ontvangen: {len(html)} bytes")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
+            locale="en-US",
+            viewport={"width": 1280, "height": 800},
+        ).new_page()
 
-    uitslagen, programma = parse_games(html)
+        # Vang console.log op voor debug
+        page.on("console", lambda msg: print(f"  [browser] {msg.text}"))
+
+        page.goto(SCHEDULE_URL, wait_until="networkidle", timeout=30000)
+
+        # Wacht op enige wedstrijdinhoud
+        try:
+            page.wait_for_selector("text=Visitor", timeout=10000)
+            print("  ✓ 'Visitor' gevonden in DOM")
+        except Exception:
+            print("  ⚠️  'Visitor' niet gevonden — pagina mogelijk leeg")
+
+        # Stap 1: debug — wat ziet de browser?
+        print("\n── Debug scan ──")
+        debug = page.evaluate(EXTRACT_JS)
+        print(f"  URL    : {debug['url']}")
+        print(f"  Title  : {debug['title']}")
+        print(f"  Nodes  : {debug['textNodeCount']}")
+        print(f"  Scores : {debug['scoreNodes']}")
+        print(f"  Tekst  :\n{debug['textSample'][:1500]}")
+
+        # Stap 2: extraheer wedstrijden
+        raw_games = page.evaluate(EXTRACT_GAMES_JS)
+        print(f"\n── {len(raw_games)} wedstrijden gevonden ──")
+
+        browser.close()
+
+    uitslagen = [g for g in raw_games if g["gespeeld"]]
+    programma = [g for g in raw_games if not g["gespeeld"]]
+
+    # Voeg dag-label en id toe
+    for i, g in enumerate(raw_games):
+        g["id"]  = i + 1
+        g["dag"] = format_dag(g["datum"])
+        g["thuis_innings"] = []
+        g["uit_innings"]   = []
+        g["innings"]       = None
+        g["locatie"]       = None
+        g["stadion"]       = None
 
     uitslagen.sort(key=lambda g: (g["datum"], g["tijdstip"] or ""))
     programma.sort(key=lambda g: (g["datum"], g["tijdstip"] or ""))
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    print(f"\nGespeelde wedstrijden ({len(uitslagen)}):")
+    print(f"\nUitslagen ({len(uitslagen)}):")
     for u in uitslagen:
         print(f"  {u['datum']} {u['tijdstip']}  {u['uit_code']} {u['score_uit']} - {u['score_thuis']} {u['thuis_code']}")
 
@@ -162,18 +213,16 @@ def main():
         print(f"  {p['datum']} {p['tijdstip']}  {p['uit_code']} @ {p['thuis_code']}")
 
     output = {
-        "bijgewerkt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "bijgewerkt": dt.datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "bron":       SCHEDULE_URL,
         "uitslagen":  uitslagen,
         "programma":  programma,
     }
 
-    with open("schedule_extraliga.json", "w", encoding="utf-8") as f:
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print(f"\n✅ schedule_extraliga.json opgeslagen")
-    print(f"   Uitslagen  : {len(uitslagen)}")
-    print(f"   Programma  : {len(programma)}")
+    print(f"\n✅ {JSON_FILE} opgeslagen — {len(uitslagen)} uitslagen, {len(programma)} programma")
 
 
 if __name__ == "__main__":
