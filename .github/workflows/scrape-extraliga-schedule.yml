@@ -2,7 +2,7 @@ name: Czech Extraliga Schedule Scraper
 
 on:
   schedule:
-    - cron: '0 * * * *'     # elk uur
+    - cron: '0 * * * *'
     - cron: '30 11 * * 5'   # vrijdag 13:30 NL
     - cron: '30 11 * * 6'   # zaterdag 13:30 NL
     - cron: '30 17 * * 6'   # zaterdag 19:30 NL
@@ -15,7 +15,6 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,11 +23,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Playwright installeren
-        run: |
-          pip install playwright
-          playwright install chromium --with-deps
 
       - name: Schedule scrapen
         run: python scraper_schedule.py
