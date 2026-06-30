@@ -1,9 +1,10 @@
 import json
 import re
-import urllib.request
+import subprocess
+import sys
 from datetime import datetime, timezone
 
-HOME_URL = "https://stats.baseball.cz/en/events/extraliga-2026/home"
+SCHEDULE_URL = "https://stats.baseball.cz/en/events/extraliga-2026/schedule-and-results"
 
 TEAM_CODES = {
     "HRO": "Hroši",
@@ -17,28 +18,33 @@ TEAM_CODES = {
 }
 
 
-def fetch_html(url):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8")
+def install_playwright():
+    subprocess.run([sys.executable, "-m", "pip", "install", "playwright", "-q"], check=True)
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"], check=True)
+
+
+def fetch_html_playwright(url):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        # Wacht tot wedstrijdinhoud geladen is
+        try:
+            page.wait_for_selector("text=Visitor", timeout=10000)
+        except Exception:
+            print("  ⚠️  'Visitor' selector timeout — pagina mogelijk leeg of anders opgebouwd")
+        html = page.content()
+        browser.close()
+    return html
 
 
 def html_to_lines(html):
-    """Strip alle HTML-tags en geef een lijst van niet-lege regels terug."""
-    # Verwijder script/style blokken volledig
     html = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', html, flags=re.DOTALL)
-    # Zet block-tags om naar newlines
     html = re.sub(r'<br\s*/?>', '\n', html)
     html = re.sub(r'</(?:div|p|li|tr|td|th|h[1-6]|section|article)>', '\n', html)
-    # Verwijder resterende tags
     html = re.sub(r'<[^>]+>', ' ', html)
-    # Decode HTML-entities
     html = html.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&nbsp;', ' ')
-    # Normaliseer whitespace per regel
     lines = []
     for line in html.splitlines():
         line = re.sub(r'[ \t]+', ' ', line).strip()
@@ -48,7 +54,6 @@ def html_to_lines(html):
 
 
 def parse_datetime(raw):
-    """'20/06/2026 13:00 (UTC +2) - Final' → ('2026-06-20', '13:00', True)"""
     m = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})', raw)
     if not m:
         return None, None, False
@@ -58,51 +63,36 @@ def parse_datetime(raw):
 
 
 def parse_games(html):
-    # Knip de "Up Next"-sectie uit
-    m = re.search(
-        r'Up Next Extraliga \d{4}(.*?)(?:Schedule\s*(?:&amp;|&)\s*Results|Tournament Leaders)',
-        html, re.DOTALL | re.IGNORECASE
-    )
-    if not m:
-        print("⚠️  'Up Next'-sectie niet gevonden in HTML")
-        # Debug: toon de eerste 2000 chars
-        lines = html_to_lines(html)
-        print("  Eerste 30 regels HTML:")
-        for l in lines[:30]:
-            print(f"    {repr(l)}")
-        return [], []
+    lines = html_to_lines(html)
 
-    section = m.group(1)
-    lines = html_to_lines(section)
+    print(f"Totaal regels na stripping: {len(lines)}")
 
-    print(f"Up Next sectie: {len(lines)} regels")
-    for i, l in enumerate(lines[:60]):
-        print(f"  {i:3}: {repr(l)}")
+    # Debug: zoek alle score-achtige regels om structuur te begrijpen
+    print("\nScore-regels gevonden:")
+    for i, l in enumerate(lines):
+        if re.match(r'^\d+\s*:\s*\d+$', l):
+            context = lines[max(0, i-3):i+4]
+            print(f"  r{i}: {[repr(x) for x in context]}")
 
-    uitslagen = []
-    programma = []
+    uitslagen, programma = [], []
     i = 0
 
     while i < len(lines):
-        # Score-regel: "3 : 13" of "0 : 0"
         score_m = re.match(r'^(\d+)\s*:\s*(\d+)$', lines[i])
         if score_m:
             score_uit   = int(score_m.group(1))
             score_thuis = int(score_m.group(2))
 
-            # Zoek uit_code: de 3-letter code vlak VOOR de score
-            # (meestal 1-2 regels terug, na "Visitor" en een img)
+            # Zoek uit_code achteruit
             uit_code = None
-            for j in range(i - 1, max(i - 5, -1), -1):
+            for j in range(i - 1, max(i - 6, -1), -1):
                 if re.match(r'^[A-Z]{3}$', lines[j]):
                     uit_code = lines[j]
                     break
 
-            # Zoek thuis_code en datum ACHTER de score
-            thuis_code = None
-            datum_str = tijdstip_str = None
+            # Zoek thuis_code en datum vooruit
+            thuis_code = datum_str = tijdstip_str = None
             is_final = False
-
             for j in range(i + 1, min(i + 10, len(lines))):
                 if re.match(r'^[A-Z]{3}$', lines[j]) and thuis_code is None:
                     thuis_code = lines[j]
@@ -111,7 +101,7 @@ def parse_games(html):
                     break
 
             if uit_code and thuis_code and datum_str:
-                wedstrijd = {
+                w = {
                     "datum":       datum_str,
                     "tijdstip":    tijdstip_str,
                     "thuis":       TEAM_CODES.get(thuis_code, thuis_code),
@@ -124,22 +114,20 @@ def parse_games(html):
                     "gespeeld":    is_final,
                     "locatie":     None,
                 }
-                if is_final:
-                    uitslagen.append(wedstrijd)
-                else:
-                    programma.append(wedstrijd)
+                (uitslagen if is_final else programma).append(w)
             else:
-                print(f"  ⚠️  Score gevonden op regel {i} maar parsing mislukt: "
-                      f"uit={uit_code} thuis={thuis_code} datum={datum_str}")
-
+                print(f"  ⚠️  Score op r{i} niet volledig: uit={uit_code} thuis={thuis_code} datum={datum_str}")
         i += 1
 
     return uitslagen, programma
 
 
 def main():
-    print(f"Ophalen van {HOME_URL}...")
-    html = fetch_html(HOME_URL)
+    print("Playwright installeren...")
+    install_playwright()
+
+    print(f"\nOphalen van {SCHEDULE_URL} via Playwright...")
+    html = fetch_html_playwright(SCHEDULE_URL)
     print(f"Ontvangen: {len(html)} bytes")
 
     uitslagen, programma = parse_games(html)
@@ -157,7 +145,7 @@ def main():
 
     output = {
         "bijgewerkt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "bron":       HOME_URL,
+        "bron":       SCHEDULE_URL,
         "uitslagen":  uitslagen,
         "programma":  programma,
     }
